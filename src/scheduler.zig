@@ -91,6 +91,7 @@ const prefix_cache_admin = @import("prefix_cache_admin.zig");
 const slot_admission = @import("slot_admission.zig");
 const vision_queue = @import("vision_queue.zig");
 const model_load = @import("model_load.zig");
+const dsv41_request_mod = @import("dsv41/dsv41_request.zig");
 const dsv41_thought_point = @import("dsv41/dsv41_thought_point.zig");
 const glm5_rows_tick = @import("glm5/glm5_rows_tick.zig");
 
@@ -287,6 +288,7 @@ pub const Slot = struct {
     ssm_entries: ?[]SSMCacheEntry,
     /// glm5_next: this request's native KDA/MLA state (`ctx.glm5_request`).
     glm5_request: ?glm5_forward_mod.Request = null,
+    dsv41_request: ?dsv41_request_mod.Request = null,
     /// SSM stride checkpoints salvaged from a prefill the client cancelled:
     /// `Generator.initWithOptions` moves its captured checkpoints into this
     /// sink before returning `error.Cancelled` (they die with the failed
@@ -632,6 +634,7 @@ pub const Slot = struct {
         self.ring_cps.deinit();
         self.cache.deinit();
         if (self.glm5_request) |*request| request.deinit();
+        dsv41_request_mod.deinit(self);
         if (self.ssm_entries) |entries| {
             if (self.model.transformer) |xfm| xfm.ssmGroupDrop(entries);
             for (entries) |*e| {
@@ -2513,6 +2516,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                     if (s.model.transformer) |xf| hc.flushPendingDisk(xf.s);
                 }
             }
+            releaseNativeState(s);
             slot_outcome.finishSpecAtCleanup(s);
             // Second slot-end path (a decode-phase cancel never reaches finishSlot); the
             // record must not outlive the bytes `s.deinit()` frees.
@@ -2811,9 +2815,7 @@ pub fn cullDecodingWith(sch: *Scheduler, commit: *const fn (*Scheduler, *Slot) v
     }
 }
 
-/// A cancelled decode-phase slot commits at the cull when its state is GLM's native request, which resets right
-/// after, or DeepSeek's live record: the next exclusive request is admitted as soon as the slot leaves `decoding`
-/// and takes that record over, so a commit at the cleanup drain would publish onto its state.
+/// Native request state retires at the cull, so cancelled slots commit their prefix before releasing it.
 fn commitsAtCull(s: *const Slot) bool {
     if (!s.cancelled.load(.acquire) or s.finished or s.error_code != null) return false;
     if (s.glm5_request != null) return true;
@@ -2829,7 +2831,11 @@ pub fn commitCancelledAtCleanup(sch: *Scheduler, s: *Slot, commit: *const fn (*S
 /// (finished, errored or cancelled) releases its reserved target state before the next
 /// admission read, not when its connection thread completes it.
 pub fn releaseNativeState(slot: *Slot) void {
-    if (slot.glm5_request) |*request| request.reset();
+    if (slot.glm5_request) |*request| {
+        request.reset();
+        return;
+    }
+    dsv41_request_mod.retire(slot);
 }
 
 /// Caller holds `queue_mu`; inference thread only (it owns the slots' arrays).
@@ -2946,6 +2952,8 @@ fn commitDeclinesPadOnly(n_gen: usize, all_pad: bool) bool {
 /// `waitNext`). Skipped for pad-only generations, vision-bearing slots
 /// (stale embeddings would be reused), and slots with no generated tokens.
 pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
+    const binding = dsv41_request_mod.begin(slot, false) catch return;
+    defer binding.end() catch |err| slot.markError(@errorName(err));
     // Phase D: per-model prefix cache — read off the slot's LoadedModel.
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return;
     if (slot.error_code != null) return;
@@ -3499,6 +3507,8 @@ fn publishHandoverToken(slot: *Slot, gen: *const Generator) void {
 }
 
 fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
+    const binding = try dsv41_request_mod.begin(slot, true);
+    defer binding.end() catch |err| slot.markError(@errorName(err));
     // Mark the phase for the whole of prefill, and clear both signals on EVERY
     // exit path (success, cancel, error). `requests_prefilling` flips at entry
     // so the panel isn't blind until the first chunk lands; the chunk loop in
@@ -4594,6 +4604,8 @@ pub fn capMtpRoundToThinkBound(gen: *Generator) void {
 }
 
 pub fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
+    const binding = try dsv41_request_mod.begin(slot, false);
+    defer binding.end() catch |err| slot.markError(@errorName(err));
     var inner_err: ?anyerror = null;
     runSingleDecodeTickInner(sch, slot) catch |e| switch (e) {
         // A reasoning-protocol dead end is this request's failure; the tick
@@ -4825,6 +4837,7 @@ test "a cancelled prefill with no Generator commits its forwarded prefix, pad-on
         slot.error_code = null;
         slot.legacy_gen = null;
         slot.glm5_request = null;
+        slot.dsv41_request = null;
         slot.cancelled_prefill = .{ .forwarded = c.forwarded };
         slot.ssm_entries = if (c.hybrid) &no_ssm else null;
         slot.full_prompt = &tokens;
@@ -6032,7 +6045,6 @@ test "a shutdown drain ends a queued request with an error, a client disconnect 
     destroyAbandoned(take.abandoned);
 }
 
-
 test "decode share: the default is 0.25 and reaches /props" {
     const saved = prefill_interleave_cached;
     defer prefill_interleave_cached = saved;
@@ -6098,8 +6110,6 @@ test "decode share: ticks to the budget, keeps one tick at zero, stops when deco
     try testing.expectEqual(@as(u32, 0), none.calls);
 }
 
-
-
 test "decode share: 0.25 owes a third of the chunk time in ticks" {
     const ms = std.time.ns_per_ms;
     var f = FakeDecodeTicks{ .left = 1000, .ns = 10 * ms };
@@ -6111,7 +6121,10 @@ test "decode share: 0.25 owes a third of the chunk time in ticks" {
 test "decode share: the kill switch disables the effective share" {
     const saved_share = prefill_decode_share;
     const saved_interleave = prefill_interleave_cached;
-    defer { prefill_decode_share = saved_share; prefill_interleave_cached = saved_interleave; }
+    defer {
+        prefill_decode_share = saved_share;
+        prefill_interleave_cached = saved_interleave;
+    }
     prefill_decode_share = 0.5;
     prefill_interleave_cached = false;
     try testing.expectEqual(@as(f32, 0), prefillDecodeShare());
@@ -6119,7 +6132,6 @@ test "decode share: the kill switch disables the effective share" {
     try testing.expectEqual(@as(f32, 0.5), prefillDecodeShare());
     try testing.expectEqual(std.math.maxInt(u64), decodeShareBudgetNs(std.math.maxInt(u64), 0.9));
 }
-
 
 test "decode share: cancelled prefill stops its hosted ticks before touching the scheduler" {
     var cancelled = std.atomic.Value(bool).init(true);
@@ -6182,6 +6194,7 @@ test "an error whose name cannot be copied still ends the consumer and leaves sc
     slot.request_start_ts = std.Io.Timestamp.now(testing.io, .boot);
     slot.legacy_gen = null;
     slot.glm5_request = null;
+    slot.dsv41_request = null;
     slot.state = .decoding;
     slot.finished = false;
     slot.error_code = null;
@@ -6218,6 +6231,7 @@ test "publishLiveKvResidency snapshots decode and prefill rows with stable ids" 
     slot.cache = .{ .entries = &.{}, .step = 0, .allocator = testing.allocator, .config = .dense };
     slot.ssm_entries = null;
     slot.glm5_request = null;
+    slot.dsv41_request = null;
     slot.ring_cps = .{};
     slot.restored_entry = 0;
     slot.full_prompt = &.{};
@@ -6314,6 +6328,7 @@ test "the live KV bill counts ring restore points and nets out a donated checkou
     slot.cache = .{ .entries = &.{}, .step = 0, .allocator = testing.allocator, .config = .dense };
     slot.ssm_entries = null;
     slot.glm5_request = null;
+    slot.dsv41_request = null;
     slot.ring_cps = .{ .fork = .{ .entries = &cp_entries, .step = 8, .allocator = testing.allocator, .config = .dense } };
     slot.full_prompt = &.{};
     slot.prompt_tokens = 8;

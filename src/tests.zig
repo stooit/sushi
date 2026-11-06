@@ -143,6 +143,8 @@ test {
     _ = @import("dsv41/dsv41_source.zig");
     _ = @import("dsv41/dsv41_owned.zig");
     _ = @import("dsv41/dsv41_model.zig");
+    _ = @import("dsv41/dsv41_serving.zig");
+    _ = @import("dsv41/dsv41_request.zig");
     _ = @import("dsv41/dsv41_stream.zig");
     _ = @import("dsv41/dsv41_borrow.zig");
     _ = @import("dsv41/dsv41_prefix.zig");

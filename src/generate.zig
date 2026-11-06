@@ -177,8 +177,7 @@ pub const MtpHeadRef = union(enum) {
     qwen4: *Transformer,
     /// mimo_v2: the checkpoint's trained heads; per-request rows live in `mimo_mtp.State`.
     mimo: *mimo_mtp.Head,
-    /// deepseek_v41: the DSpark stages and their windows live on the model's own state, so a request that
-    /// drafts with them (`nextDspark`) holds the model exclusively.
+    /// deepseek_v41: DSpark windows live on the bound request; the stages' weights are shared.
     dsv41: *Transformer,
 
     /// Is this head's decode state module-owned (one per model, `Qwen4Mtp.cache`) rather
@@ -187,7 +186,7 @@ pub const MtpHeadRef = union(enum) {
         return switch (self) {
             // Per-request state swaps onto the module (`Qwen4MtpState`); nothing is shared.
             .qwen4, .mimo => false,
-            // The model's own request state; its slot is exclusive through `ownsModuleDecodeState`.
+            // DSpark uses the bound request's windows.
             .dsv41 => false,
         };
     }

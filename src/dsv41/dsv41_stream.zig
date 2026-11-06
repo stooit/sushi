@@ -2820,7 +2820,7 @@ test "dsv41 kernels: the load's warm leaves no state, and the served logits are 
         defer served.deinit();
         if (warm) {
             try model.warmKernels(served.m);
-            try testing.expect(served.m.dec_state == null);
+            try testing.expect(served.m.request().state == null);
         }
         var all: std.ArrayList(f32) = .empty;
         errdefer all.deinit(testing.allocator);

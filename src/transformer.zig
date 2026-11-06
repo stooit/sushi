@@ -1764,19 +1764,7 @@ pub const Transformer = struct {
             m.deinit(self.allocator);
             self.qwen4_mtp = null;
         }
-        if (self.dsv41) |m| {
-            m.deinit();
-            self.dsv41 = null;
-        }
-        if (self.dsv41_experts) |st| {
-            self.allocator.destroy(st);
-            self.dsv41_experts = null;
-        }
-        if (self.dsv41_stq_experts) |st| {
-            st.deinit();
-            self.allocator.destroy(st);
-            self.dsv41_stq_experts = null;
-        }
+        dsv41_serving.deinit(self);
         if (self.expert_stream) |engine| {
             engine.deinit();
             self.allocator.destroy(engine);
@@ -2464,13 +2452,19 @@ pub const Transformer = struct {
     /// module-owned piece on this arch is the MTP head's cache, and the
     /// scheduler makes the SLOT that uses it exclusive (`slotExclusiveDecode`).
     /// glm5: weights only; each slot's `glm5_forward.Request` rides `ForwardCtx.glm5_request`.
-    pub const module_shared_readonly_fields = [_][]const u8{ "qwen4", "expert_stream", "glm5" };
+    pub const module_shared_readonly_fields = [_][]const u8{ "qwen4", "expert_stream", "glm5", "dsv41" };
 
     /// Whether this model is single-flight at admission (`slot_admission.modelExclusiveDecode`).
     pub fn ownsModuleDecodeState(self: *const Transformer) bool {
         // A streamed GLM load (the KLD teacher) admits one claimant per expert stream.
         if (self.glm5) |m| if (m.expert_stream != null) return true;
-        return self.dsv41 != null;
+        if (self.dsv41 != null) return dsv41_serving.exclusiveLoad(self);
+        return false;
+    }
+
+    pub fn exclusiveAdmission(self: *const Transformer) bool {
+        if (self.dsv41 != null) return dsv41_serving.exclusiveAdmission(self);
+        return self.ownsModuleDecodeState();
     }
 
     pub fn sharesModuleReadonlyState(self: *const Transformer) bool {

@@ -247,7 +247,9 @@ the rings), the restore points in flight to SSD (below), and a decode or verify 
   unwired in T ms` and `[dsv41-borrow] restored n layers (X GB) in T ms before decode`.
 
 Why it never over-commits: admission proved `state + max(decode, prefill - lendable) <= available` against live
-memory, and the request runs alone (`exclusive`). During the prefill each forward runs only once `headroom >= need`,
+memory. Streamed loads run alone; resident loads bill each active request separately and hold new admissions while
+expert pools are borrowed. Before switching requests the inference thread settles pending GPU work and lazy DSpark
+projection, so no request retains readers of another forward's expert scratch. During prefill each forward runs only once `headroom >= need`,
 counting the bytes just released; its transient is freed before the next, so the state it promised later still fits.
 A restore gives back exactly the bytes released, so the decode finds what admission promised it.
 

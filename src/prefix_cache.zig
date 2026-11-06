@@ -638,8 +638,6 @@ pub const HotPrefixCache = struct {
     last_restored_disk_id: ?u64 = null,
     /// DeepSeek: the last lookup rolled the model's live state back instead of restoring a stored point.
     last_restored_live: bool = false,
-    /// DeepSeek: the points of the slot's last request, which its live state can be rolled back to.
-    live_dsv41: dsv41_prefix.Live = .{},
     /// The arch keeps a QSA indexer history beside its SSM state (qwen4_exp).
     /// A restore that leaves the live entries without it cannot prefill —
     /// `qsaMaskFromQk` errors on every turn on that prefix — so it is a MISS.
@@ -685,7 +683,6 @@ pub const HotPrefixCache = struct {
         self.entries.deinit(self.allocator);
         if (self.pending_disk) |*p| p.deinit(self.allocator);
         self.pending_disk = null;
-        self.live_dsv41.deinit(self.allocator);
         if (self.disk) |*d| d.deinit();
         self.disk = null;
     }
@@ -1511,27 +1508,8 @@ pub const HotPrefixCache = struct {
                     const cp = highestCheckpointAtOrBelow(cps, m.shared) orelse break :blk 0;
                     break :blk cp.pos;
                 } else 0;
-                const hm = d.bestHybridMatch(prompt_ids, has_tools, target_cache.config, @intCast(prompt_ids.len), media_limits) orelse break :disk;
-                if (@as(usize, hm.cp) < ram_eff + kv_disk_cache.MIN_DISK_ADVANTAGE_TOKENS) break :disk;
-                const sw = io_util.Stopwatch.init(d.io);
-                var cp = d.restoreCheckpointInto(target_cache, hm.idx, hm.cp, dsv41_prefix.snapshotLayers(rec.dsv41), s) catch |err| {
-                    log.warn("  [disk-cache] DeepSeek restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
-                    poisonUnreadable(d, hm.idx, err);
-                    target_cache.truncate(0, s) catch {};
-                    break :disk;
-                };
-                defer cp.deinit(d.allocator);
-                dsv41_prefix.restore(rec.dsv41, &cp, prompt_ids) catch |err| {
-                    log.warn("  [disk-cache] DeepSeek state not installed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
-                    target_cache.truncate(0, s) catch {};
-                    rec.reset();
-                    break :disk;
-                };
-                target_moe_seq_offset.* = hm.cp;
-                self.last_restored_disk_id = d.entries.items[hm.idx].id;
-                self.live_dsv41.keepRestored(self.allocator, rec.dsv41, &cp, true) catch {};
-                log.info("  [disk-cache] restored {d}/{d} tokens from SSD in {d}ms (dsv41@{d})\n", .{ hm.cp, prompt_ids.len, sw.read() / std.time.ns_per_ms, hm.cp });
-                return .{ .matched = hm.cp, .full_match = false, .slot_owned = true };
+                if (dsv41_prefix.restoreFromDisk(self, d, rec.dsv41, target_cache, target_moe_seq_offset, ram_eff, prompt_ids, has_tools, media_limits, s)) |res| return res;
+                break :disk;
             }
             const disk_limit: u32 = @intCast(prompt_ids.len);
             // A ringed cache restores only at a ring file: the chunks hold its other layers alone.
@@ -1750,7 +1728,7 @@ pub const HotPrefixCache = struct {
             effective_matched = 0;
             if (e.ssm_checkpoints) |cps| if (highestCheckpointAtOrBelow(cps, restore_cap)) |cp| {
                 try dsv41_prefix.restore(rec.dsv41, cp, prompt_ids);
-                self.live_dsv41.keepRestored(self.allocator, rec.dsv41, cp, false) catch {};
+                rec.dsv41.request().live.keepRestored(rec.dsv41.gpa, rec.dsv41, cp, false) catch {};
                 effective_matched = cp.pos;
             };
             if (effective_matched == 0) rec.reset();

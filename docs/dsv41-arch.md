@@ -1,7 +1,7 @@
 # DeepSeek-V4.1-Flash (`deepseek_v41`)
 
 The fourth served architecture: the release's own checkpoint (FP8 trunk, FP4 routed experts, Engram tables), or an STQ
-pack of it, served with the experts streamed from SSD. What it loads, how it is billed, what is proven against the reference and
+pack of it, served through an expert cache that can be fully resident. What it loads, how it is billed, what is proven against the reference and
 what is not.
 
 Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-expert-streaming](engine-expert-streaming.md),
@@ -10,12 +10,12 @@ Index: [CLAUDE.md](../CLAUDE.md#docs-index). Related: [engine-expert-streaming](
 ## Scope
 
 - It serves `deepseek_v41` from the ORIGINAL checkpoint (`config.json`, `model-*.safetensors`, the index). Text in,
-  text out, one request at a time (the model holds the request's state: `ownsModuleDecodeState`).
+  text out. Resident-expert loads interleave independent requests up to `--max-concurrent`; streamed-expert loads remain exclusive. Each slot owns its continuation, DSpark windows, Engram read-ahead and live prefix checkpoints. This is not batched forward/decode.
 - Off, by name: `--kv-quant` (the state is the activation dtype;
   `kvCacheFor` answers dense; a launch `--kv-quant`, `--qwen-gdn 16`, `--mtp-head-kv-quant`, `--mtp-typical`, `--mtp-tokenv3` or `--mtp-greedy-tail` refuses the load (DSpark accepts by the exact rule only), a settings `kv_quant`, `mtp_acceptance` or `mtp_greedy_tail` is ignored with one line). The prefix cache reuses a prompt's prefix ([below](#prefix-cache)). Speculative decoding is DSpark
   ([below](#dspark)), the checkpoint's own drafter, on by default like every served MTP head; `--no-mtp` turns it off.
-- Routed experts always stream: 289 GB of FP4 against a 128 GB box. `--ssd-budget-gb` (or `ssd_budget_gb` in
-  model-settings) is required, as on every streamed load; without one the load fails with `ExpertStreamingRequired`.
+- The original FP4 routed bank is 289 GB and streams on a 128 GB box. `--ssd-budget-gb` (or `ssd_budget_gb` in
+  model-settings) is required when the experts do not fit. A smaller STQ bank on a larger box can load every expert into RAM.
 - Thinking: `low` 50, `medium` 62, `high` 75, `xhigh` 87, `max` 100 on the encoder's 1-100 effort scale (its own
   words are low/high/max; medium and xhigh reach it as numbers), default `high`; the DeepSeek effort table
   (`effort:deepseek_v41`, [server-http-apis](server-http-apis.md#effort-tables)) can send any 1-100 value, cap or refuse each word; a request that names no thinking or effort thinks, at `high` (`ModelConfig.defaultEnableThinking`; an explicit field wins, `enable_thinking: false` or effort `off` is a `chat` render). The template is [src/fixtures/dsv41_chat_template.jinja](../src/fixtures/dsv41_chat_template.jinja),

@@ -227,13 +227,11 @@ pub fn fillGroupPadWasteKvLens(
     for (caches, 0..) |c, i| out[i] = batchKvLenOfWith(c, cfg, seq_len);
 }
 
-/// A model whose per-request decode state is MODULE-OWNED (one per model,
-/// not per slot) — at most ONE in-flight request may touch it. Ask the
-/// transformer which archs own their decode state; never key on
-/// a batching verdict and never name one arch here.
+/// Models with shared mutable decode state or temporarily borrowed expert pools admit one live slot.
+/// Inference-thread only: pool residency can change between forwards.
 pub fn modelExclusiveDecode(model: *const model_registry_mod.LoadedModel) bool {
     const t = model.transformer orelse return false;
-    return t.ownsModuleDecodeState();
+    return t.exclusiveAdmission();
 }
 
 /// Pure core of `slotExclusiveDecode`. `model_owns_state` wins outright and is never

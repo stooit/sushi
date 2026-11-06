@@ -230,3 +230,53 @@ test "tailUnread: a chunk is state only when no point is taken and the next chun
     try t.expect(!tailUnread(128, 128, 2048, false));
     try t.expect(!tailUnread(0, 2048, 2048, false));
 }
+
+test "dsv41 resident experts permit independent requests while streamed experts stay exclusive" {
+    var engine: expert_stream_mod.Engine = undefined;
+    engine.plan = undefined;
+    engine.plan.resident = true;
+    var layers: [2]std.meta.Elem(@TypeOf(engine.layers)) = undefined;
+    for (&layers) |*layer| {
+        layer.active = true;
+        layer.borrowed = false;
+        layer.resident_map = .{ .ctx = @ptrFromInt(16) };
+    }
+    engine.layers = &layers;
+    var model: dsv41_model.Model = undefined;
+    var xfm: Transformer = undefined;
+    xfm.glm5 = null;
+    xfm.dsv41 = &model;
+    xfm.expert_stream = &engine;
+    try std.testing.expect(!xfm.ownsModuleDecodeState());
+    try std.testing.expect(!xfm.exclusiveAdmission());
+    layers[1].borrowed = true;
+    try std.testing.expect(!xfm.ownsModuleDecodeState());
+    try std.testing.expect(xfm.exclusiveAdmission());
+    layers[1].borrowed = false;
+    layers[1].resident_map.ctx = null;
+    try std.testing.expect(xfm.exclusiveAdmission());
+    layers[1].resident_map.ctx = @ptrFromInt(16);
+    engine.plan.resident = false;
+    try std.testing.expect(xfm.ownsModuleDecodeState());
+    xfm.expert_stream = null;
+    try std.testing.expect(xfm.ownsModuleDecodeState());
+}
+
+pub const exclusiveLoad = @import("dsv41_request.zig").exclusiveLoad;
+pub const exclusiveAdmission = @import("dsv41_request.zig").exclusiveAdmission;
+
+pub fn deinit(self: *Transformer) void {
+    if (self.dsv41) |m| {
+        m.deinit();
+        self.dsv41 = null;
+    }
+    if (self.dsv41_experts) |st| {
+        self.allocator.destroy(st);
+        self.dsv41_experts = null;
+    }
+    if (self.dsv41_stq_experts) |st| {
+        st.deinit();
+        self.allocator.destroy(st);
+        self.dsv41_stq_experts = null;
+    }
+}

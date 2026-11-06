@@ -392,7 +392,7 @@ test "DeepSeek SSD tier: restore points a prefill writes through leave RAM as th
             // What the prefill still holds is the tier's row markers (a byte a token for keys and for values) and the point's
             // fixed arrays kept for the next turn's rollback, not the state. Metal rounds a small buffer up to the next
             // power of two, so a kept array may occupy twice its bytes.
-            try testing.expect(after <= before + 2 * at + 2 * hc.live_dsv41.bytes());
+            try testing.expect(after <= before + 2 * at + 2 * net.m.request().live.bytes());
         }
         cache.step = first.len;
         try dsv41_prefix.markRows(&cache);
@@ -568,7 +568,7 @@ test "DeepSeek SSD tier split: a write-through prefill stages the points on the 
         hc.disk.?.drainWriter();
         try testing.expect(cps.items[cps.items.len - 1].isReleased());
         // Every point is kept for the next turn's rollback, staged or not.
-        try testing.expectEqual(at, hc.live_dsv41.points.items[hc.live_dsv41.points.items.len - 1].pos);
+        try testing.expectEqual(at, net.m.request().live.points.items[net.m.request().live.points.items.len - 1].pos);
         if (step == 1) {
             try testing.expectEqual(before, hc.disk.?.point_bytes_written);
             try testing.expectEqual(@as(usize, 1), hc.disk.?.entries.items[0].ssm_positions.len);
@@ -933,7 +933,7 @@ test "DeepSeek live flush: another conversation takes the model and every point 
         try flushTurn(&net, &hc, first, &gen, &want_end, &want_thought);
         // Until the handover only the grid point is on SSD; the other two ride the live record.
         try testing.expectEqualSlices(u32, &.{512}, hc.disk.?.entries.items[0].ssm_positions);
-        try testing.expectEqual(@as(usize, 3), hc.live_dsv41.points.items.len);
+        try testing.expectEqual(@as(usize, 3), net.m.request().live.points.items.len);
         const res = try dsv41Lookup(&hc, &net, &other);
         try testing.expectEqual(@as(usize, 0), res.matched);
         hc.disk.?.drainWriter();
@@ -1253,10 +1253,10 @@ test "DeepSeek live rollback: a turn that diverges inside the last turn's genera
         hc.flushPendingDisk(s);
         hc.disk.?.drainWriter();
         // The two points' fixed arrays and the history's ids ride beside the model's state.
-        const sets = hc.live_dsv41.points.items.len;
+        const sets = net.m.request().live.points.items.len;
         try testing.expectEqual(@as(usize, 2), sets);
-        try testing.expect(hc.live_dsv41.bytes() > all.len * @sizeOf(u32));
-        try testing.expect(hc.live_dsv41.bytes() <= sets * net.m.cfg.stateFixedBytes(true) + all.len * @sizeOf(u32));
+        try testing.expect(net.m.request().live.bytes() > all.len * @sizeOf(u32));
+        try testing.expect(net.m.request().live.bytes() <= sets * net.m.cfg.stateFixedBytes(true) + all.len * @sizeOf(u32));
 
         // The live state serves: the deepest point under the 610 shared tokens, with no stored copy read.
         var target = try KVCache.initWithConfig(testing.allocator, net.m.cfg.layers, kv_quant.KVQuantConfig.dense);
@@ -1343,8 +1343,8 @@ test "DeepSeek live rollback: another conversation, a replaced state or a point 
     for (other[100..]) |*t| t.* = 92;
     try testing.expectEqual(@as(usize, 0), (try dsv41Lookup(&hc, &net, &other)).matched);
     try testing.expect(!hc.last_restored_live);
-    try testing.expectEqual(@as(usize, 0), hc.live_dsv41.points.items.len);
-    try testing.expectEqual(@as(u64, 0), hc.live_dsv41.bytes());
+    try testing.expectEqual(@as(usize, 0), net.m.request().live.points.items.len);
+    try testing.expectEqual(@as(u64, 0), net.m.request().live.bytes());
 
     // The model's state was replaced after the turn: the stored point serves.
     try Turn.run(&hc, &net, first);
@@ -1354,8 +1354,8 @@ test "DeepSeek live rollback: another conversation, a replaced state or a point 
     try testing.expect(!hc.last_restored_live);
     try testing.expect(hc.last_restored_disk_id != null);
     // The restored point is the first of this request's own.
-    try testing.expectEqual(@as(usize, 1), hc.live_dsv41.points.items.len);
-    try testing.expectEqual(@as(usize, 512), hc.live_dsv41.points.items[0].pos);
+    try testing.expectEqual(@as(usize, 1), net.m.request().live.points.items.len);
+    try testing.expectEqual(@as(usize, 512), net.m.request().live.points.items[0].pos);
 
     // The live state serves where it can: the same prompt after a finished turn.
     try Turn.run(&hc, &net, first);

@@ -100,7 +100,7 @@ pub const LivePoint = struct { pos: usize, slots: []model.Slot, flushed: bool = 
 
 /// The slot's last request, as the next one can roll its live state back into: the points it took and the tokens the
 /// state covers. The rows are the live state's own, append-only, so a point costs its fixed arrays alone. Held only
-/// while the model's state is the one it was recorded for (`model.Model.state_epoch`).
+/// while the model's state is the one it was recorded for (`model.Request.epoch`).
 pub const Live = struct {
     points: std.ArrayList(LivePoint) = .empty,
     tokens: []u32 = &.{},
@@ -198,7 +198,7 @@ pub const Live = struct {
 
     /// The request over the state finished with `tokens` as its history: its points become what the next one may roll back to.
     pub fn publish(self: *Live, allocator: std.mem.Allocator, m: *const model.Model, tokens: []const u32, has_tools: bool, vision_key: u64, media_start: ?u32) void {
-        const st = m.dec_state orelse return self.clear(allocator);
+        const st = m.requestConst().state orelse return self.clear(allocator);
         const covered = @min(st.n, tokens.len);
         while (self.points.items.len > 0 and self.points.items[self.points.items.len - 1].pos > covered) {
             var p = self.points.pop().?;
@@ -211,15 +211,15 @@ pub const Live = struct {
         self.has_tools = has_tools;
         self.vision_key = vision_key;
         self.media_start = media_start;
-        self.epoch = m.state_epoch;
+        self.epoch = m.requestConst().epoch;
         self.ready = true;
     }
 
     /// The deepest point a request over `prompt` may roll the live state back to: at most `media_cap` tokens in,
     /// short of the prompt's end, and only while the state's rows outside the request's own bill would still fit it.
     pub fn pick(self: *const Live, m: *const model.Model, prompt: []const u32, has_tools: bool, media_cap: usize) ?usize {
-        if (!self.ready or self.epoch != m.state_epoch or self.has_tools != has_tools) return null;
-        const st = m.dec_state orelse return null;
+        if (!self.ready or self.epoch != m.requestConst().epoch or self.has_tools != has_tools) return null;
+        const st = m.requestConst().state orelse return null;
         var shared: usize = 0;
         const max_shared = @min(self.tokens.len, prompt.len);
         while (shared < max_shared and self.tokens[shared] == prompt[shared]) shared += 1;
@@ -258,7 +258,7 @@ pub fn markRows(cache: *transformer.KVCache) !void {
     transformer.resetKVEntry(e);
     // A slot's cache takes the engine's KV scheme whatever the pack says, and a quantized entry owns six buffers.
     const slots = [_]*mlx.mlx_array{ &e.keys, &e.values, &e.keys_scales, &e.keys_biases, &e.values_scales, &e.values_biases };
-    for (slots[0 .. if (cache.config.scheme == .off) 2 else 6]) |slot| {
+    for (slots[0..if (cache.config.scheme == .off) 2 else 6]) |slot| {
         _ = mlx.mlx_array_free(slot.*);
         slot.* = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_zeros(slot, &[_]c_int{ 1, 1, @intCast(n), 1 }, 4, .uint8, mlx.gpuStream()));
@@ -366,7 +366,7 @@ fn rollbackLive(
     media_limits: kv_disk_cache.MediaLimits,
     ram_match: anytype,
 ) ?pc.LookupResult {
-    const live = &self.live_dsv41;
+    const live = &m.request().live;
     const cap: usize = if (media_limits.rule) |r| (r.limitFor(r.ctx, live.vision_key, live.media_start) orelse 0) else kv_disk_cache.MediaLimits.UNBOUNDED;
     const idx = live.pick(m, prompt_ids, has_tools, cap) orelse return null;
     const pos = live.points.items[idx].pos;
@@ -378,9 +378,9 @@ fn rollbackLive(
         stored = @max(stored, hm.cp);
     };
     if (stored > pos) return null;
-    live.rollback(self.allocator, m, idx, prompt_ids) catch |err| {
+    live.rollback(m.gpa, m, idx, prompt_ids) catch |err| {
         log.warn("  [dsv41-prefix] live state not rolled back: {s}; a stored point serves\n", .{@errorName(err)});
-        live.clear(self.allocator);
+        live.clear(m.gpa);
         return null;
     };
     target_cache.truncate(0, s) catch {};
@@ -394,7 +394,7 @@ fn rollbackLive(
 /// point leaves RAM at once, the newest too: the writer has copied each into its own bounded host buffers when the
 /// commit returns. A point off the grid is kept live only (`Live`), whatever the tier does. Below the tier's floor nothing is written and the points stay for the commit.
 /// `held` names the phase that waited on the writer, for the log.
-pub fn writeThroughDsv41(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, cache: *transformer.KVCache, prompt: []const u32, has_tools: bool, media: pc.MediaStamp, cps: []SSMCheckpoint, s: mlx.mlx_stream, held: []const u8) void {
+pub fn writeThroughDsv41(self: *pc.HotPrefixCache, m: *dsv41_model.Model, cache: *transformer.KVCache, prompt: []const u32, has_tools: bool, media: pc.MediaStamp, cps: []SSMCheckpoint, s: mlx.mlx_stream, held: []const u8) void {
     if (self.disk == null or prompt.len < kv_disk_cache.MIN_PERSIST_TOKENS) return;
     var pending = false;
     for (cps) |*cp| pending = pending or !cp.isReleased();
@@ -403,16 +403,16 @@ pub fn writeThroughDsv41(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, 
         log.warn("  [disk-cache] DeepSeek prefill write-through rows not marked: {s}\n", .{@errorName(err)});
         return;
     };
-    for (cps) |*cp| if (!cp.isReleased()) self.live_dsv41.keep(self.allocator, m, cp, false) catch |err| {
+    for (cps) |*cp| if (!cp.isReleased()) m.request().live.keep(m.gpa, m, cp, false) catch |err| {
         log.warn("  [dsv41-prefix] live point at {d} not kept: {s}\n", .{ cp.pos, @errorName(err) });
     };
     // A point off the row-segment grid would copy the rows past the last segment into its own file; it stays live.
     const span: usize = if (self.disk.?.grown) |g| g.span else 0;
     for (cps) |*cp| if (!cp.isReleased() and span != 0 and cp.pos % span != 0) cp.release();
-    for (cps) |*cp| if (!cp.isReleased()) self.live_dsv41.markFlushed(cp.pos);
+    for (cps) |*cp| if (!cp.isReleased()) m.request().live.markFlushed(cp.pos);
     const staged_before = self.disk.?.point_bytes_written;
     var sw = io_util.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
-    self.disk.?.rows_base = @intCast(self.live_dsv41.base);
+    self.disk.?.rows_base = @intCast(m.request().live.base);
     defer self.disk.?.rows_base = std.math.maxInt(u32);
     self.writeThroughHybrid(cache.entries, cache.config, prompt, has_tools, media, cps, std.math.maxInt(u64), s);
     const bytes = self.disk.?.point_bytes_written - staged_before;
@@ -431,16 +431,16 @@ pub fn writeDecodePointDsv41(self: *pc.HotPrefixCache, cache: *transformer.KVCac
 
 /// The request over `m`'s state finished with `tokens`: the points it kept are what the next prompt may roll back to.
 /// True when the record holds points that are not on SSD.
-pub fn publishLiveDsv41(self: *pc.HotPrefixCache, m: *const dsv41_model.Model, tokens: []const u32, has_tools: bool, media: pc.MediaStamp, quant: kv_quant.KVQuantConfig) bool {
-    self.live_dsv41.publish(self.allocator, m, tokens, has_tools, media.key, media.start);
-    self.live_dsv41.quant = quant;
-    return self.live_dsv41.unflushed();
+pub fn publishLiveDsv41(_: *pc.HotPrefixCache, m: *dsv41_model.Model, tokens: []const u32, has_tools: bool, media: pc.MediaStamp, quant: kv_quant.KVQuantConfig) bool {
+    m.request().live.publish(m.gpa, m, tokens, has_tools, media.key, media.start);
+    m.request().live.quant = quant;
+    return m.request().live.unflushed();
 }
 
 /// The state is about to be replaced: its record reaches SSD (`flushLiveDsv41`), then goes.
 pub fn releaseLive(self: *pc.HotPrefixCache, m: *dsv41_model.Model, s: mlx.mlx_stream, why: []const u8) void {
     flushLiveDsv41(self, m, s, why);
-    self.live_dsv41.clear(self.allocator);
+    m.request().live.clear(m.gpa);
 }
 
 /// `flushLiveDsv41` for a resident model, if it is a DeepSeek one. Inference thread.
@@ -456,11 +456,11 @@ pub fn flushResident(entry: *@import("../model_registry.zig").LoadedModel, why: 
 /// appends to it; a point a later prefill overwrote is no longer in the record. A record with images is written under
 /// its vision key, which hashes the pixels, so only a prompt with the same images restores past the first image row.
 pub fn flushLiveDsv41(self: *pc.HotPrefixCache, m: *dsv41_model.Model, s: mlx.mlx_stream, why: []const u8) void {
-    const live = &self.live_dsv41;
-    if (self.disk == null or !self.ssd_first or !live.ready or live.epoch != m.state_epoch) return;
+    const live = &m.request().live;
+    if (self.disk == null or !self.ssd_first or !live.ready or live.epoch != m.requestConst().epoch) return;
     // A pixel key with no boundary proves nothing about where its rows begin (`diskTextLen`).
     if (live.vision_key != 0 and live.media_start == null) return;
-    const st = m.dec_state orelse return;
+    const st = m.requestConst().state orelse return;
     var cps: std.ArrayList(SSMCheckpoint) = .empty;
     defer {
         for (cps.items) |*cp| cp.deinit(self.allocator);
@@ -587,4 +587,39 @@ pub const checkpoint_cap: u32 = 4;
 
 pub fn checkpointMax(global: u32) u32 {
     return if (global == 0) checkpoint_cap else @min(global, checkpoint_cap);
+}
+
+pub fn restoreFromDisk(
+    self: *pc.HotPrefixCache,
+    d: *kv_disk_cache.DiskTier,
+    m: *model.Model,
+    target_cache: *KVCache,
+    target_moe_seq_offset: *usize,
+    ram_eff: usize,
+    prompt_ids: []const u32,
+    has_tools: bool,
+    media_limits: kv_disk_cache.MediaLimits,
+    s: mlx.mlx_stream,
+) ?pc.LookupResult {
+    const hm = d.bestHybridMatch(prompt_ids, has_tools, target_cache.config, @intCast(prompt_ids.len), media_limits) orelse return null;
+    if (@as(usize, hm.cp) < ram_eff + kv_disk_cache.MIN_DISK_ADVANTAGE_TOKENS) return null;
+    const sw = io_util.Stopwatch.init(d.io);
+    var cp = d.restoreCheckpointInto(target_cache, hm.idx, hm.cp, snapshotLayers(m), s) catch |err| {
+        log.warn("  [disk-cache] DeepSeek restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
+        pc.HotPrefixCache.poisonUnreadable(d, hm.idx, err);
+        target_cache.truncate(0, s) catch {};
+        return null;
+    };
+    defer cp.deinit(d.allocator);
+    restore(m, &cp, prompt_ids) catch |err| {
+        log.warn("  [disk-cache] DeepSeek state not installed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
+        target_cache.truncate(0, s) catch {};
+        model.resetState(m);
+        return null;
+    };
+    target_moe_seq_offset.* = hm.cp;
+    self.last_restored_disk_id = d.entries.items[hm.idx].id;
+    m.request().live.keepRestored(m.gpa, m, &cp, true) catch {};
+    log.info("  [disk-cache] restored {d}/{d} tokens from SSD in {d}ms (dsv41@{d})\n", .{ hm.cp, prompt_ids.len, sw.read() / std.time.ns_per_ms, hm.cp });
+    return .{ .matched = hm.cp, .full_match = false, .slot_owned = true };
 }

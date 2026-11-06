@@ -114,9 +114,8 @@ test "a streamed DeepSeek load bills its union workspace and MLX pool and no fil
 /// rings, compressed and index rows, DSpark windows, and the live restore points the request keeps.
 pub fn dsv41StateBytes(s: *const Slot) u64 {
     const dsv = (s.model.transformer orelse return 0).dsv41 orelse return 0;
-    var bytes: u64 = if (dsv.dec_state) |*st| @import("dsv41_model.zig").stateBytes(st) else 0;
-    if (s.model.prefix_cache) |*hc| bytes += hc.live_dsv41.bytes();
-    return bytes;
+    if (s.dsv41_request) |*request| return request.bytes();
+    return dsv.requestConst().bytes();
 }
 
 /// The request over a DeepSeek model's state finished with `tokens`: its record is published, and the idle flush armed
@@ -243,6 +242,7 @@ fn dsv41CullScaffold(sch: *Scheduler, model: *model_registry_mod.LoadedModel, xf
     slot.max_tokens = 8;
     slot.legacy_gen = null;
     slot.glm5_request = null;
+    slot.dsv41_request = null;
     slot.finished = false;
     slot.error_code = null;
     slot.cancelled = .init(false);
@@ -342,20 +342,20 @@ test "a DeepSeek slot's state bytes hold the model's rows and windows and the li
     model.prefix_cache = prefix_cache_mod.HotPrefixCache.init(a, 2);
     defer model.prefix_cache.?.deinit();
     model.transformer = &xfm;
-    const hc = &model.prefix_cache.?;
     var cp = try dsv41_prefix.capture(a, m, 40);
     defer cp.deinit(a);
-    try hc.live_dsv41.keep(a, m, &cp, false);
+    try m.request().live.keep(a, m, &cp, false);
     var slot: Slot = undefined;
     slot.model = &model;
     slot.cache = .{ .entries = &.{}, .step = 0, .allocator = a, .config = .dense };
     slot.ssm_entries = null;
     slot.ring_cps = .{};
     slot.glm5_request = null;
+    slot.dsv41_request = null;
     slot.legacy_gen = null;
 
-    const rows_and_windows = dsv41_model.stateBytes(&m.dec_state.?);
+    const rows_and_windows = dsv41_model.stateBytes(&m.request().state.?);
     try testing.expect(rows_and_windows > 0);
-    try testing.expect(hc.live_dsv41.bytes() > 0);
-    try testing.expectEqual(rows_and_windows + hc.live_dsv41.bytes(), slotStateBytes(&slot));
+    try testing.expect(m.request().live.bytes() > 0);
+    try testing.expectEqual(rows_and_windows + m.request().live.bytes(), slotStateBytes(&slot));
 }

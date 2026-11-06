@@ -4,7 +4,7 @@ A native Zig inference engine for Apple Silicon serving Qwen3.8-Flash-Next (`qwe
 and DeepSeek-V4.1-Flash (`deepseek_v41`). MiMo-V2.6-Flash (`mimo_v2`) is unsupported from 1.5.1: still served, never
 release-gated (no test, bench or tuning for a release). Qwen and MiMo use native MTP and affine8 KV by
 default. GLM batches up to four requests over an affine8 MLA latent and FP32 KDA state, with DFlash2; its MTP stays off.
-DeepSeek serves one request at a time with streamed experts and DSpark. OpenAI/Anthropic-compatible HTTP, no Python at
+DeepSeek interleaves requests with resident experts and DSpark; streamed-expert loads remain exclusive. OpenAI/Anthropic-compatible HTTP, no Python at
 serve time. Fork of ddalcu's mlx-serve.
 
 - **sushi** is public code: every change ships with its license, NOTICE and docs story.

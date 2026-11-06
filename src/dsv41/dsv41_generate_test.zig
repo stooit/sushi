@@ -1571,7 +1571,7 @@ test "dsv41 generator: a chunked prefill tells the model the tokens after each c
     try testing.expect(count.n > 4);
     // Every forward but the first, the final span included, started with the rows read during the one before it.
     try testing.expectEqual(@as(u64, count.n - 1), xfm.dsv41.?.engram_ahead_used);
-    try testing.expect(xfm.dsv41.?.engram_ahead == null);
+    try testing.expect(xfm.dsv41.?.request().ahead == null);
 }
 
 test "dsv41 generator: after a DSpark request the slot cache marks its rows and snapshots like the scheduler's commit (DSV41_TINY)" {

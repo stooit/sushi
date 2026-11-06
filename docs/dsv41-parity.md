@@ -17,7 +17,8 @@ item).
 | Spec decode under repeat / presence / think penalty | works | verify rows shifted by `penaltyShiftRows`, `thinkShiftRows`; distinct-id test |
 | Spec decode under a thinking bound (Anthropic `budget_tokens`, `reasoning_budget_tokens`) | works | bound checked between rounds (a round is cut to the thought room), DSpark resumes for the answer; `a thinking bound that fires mid-round` |
 | Spec decode with logprobs, grammar, forced call | N/A | MTP refuses the same three (`mtp_plan.mtpRefusal`); they decode serially |
-| Batched decode, several slots | gap | `ownsModuleDecodeState`: one request at a time; `/props` `batching.reason = exclusive` |
+| Concurrent requests | resident experts | Per-slot state and interleaved prefill/decode; streamed experts remain exclusive |
+| Batched decode | gap | No batched forward; `batched_decode` remains false |
 | Hot / SSD prefix cache | works | restore points of the whole state, RAM and SSD tiers, bit-identical to cold ([dsv41-arch](dsv41-arch.md#prefix-cache)) |
 | Per-request prefill chunk ladder | works | `perRequestPrefillChunk` is true for the arch; each request takes the widest rung its bill admits ([dsv41-arch](dsv41-arch.md#ced)) |
 | `--mtp-min-depth` / `--mtp-max-depth` | works | bound the DSpark verify width to depth + 1 rows; the boot log prints `[spec] DSpark verifies a..b rows a round` when either is given |
@@ -54,9 +55,8 @@ Ranked by what an agent client feels.
 2. **Prefill throughput.** The routed experts' fill and grouped GEMM are about 55% of a warm chunk
    ([dsv41-arch](dsv41-arch.md#ced)). A layer-ahead read of the next layer's guessed experts was tried and cut: it guessed
    about a quarter of the picks and bought nothing.
-3. **Batched decode.** The model holds one request's rings, compressed rows, Engram history and DSpark windows
-   (`Model.state`). Batching needs that state per slot (a `State` already exists as one struct), a batched
-   `extend` over rows of different positions, and the expert union across slots. Large.
+3. **Batched decode.** Resident loads already interleave per-slot rings, compressed rows, Engram history and DSpark windows.
+   Batching still needs `extend` over rows of different positions and the expert union across slots.
 4. **Hard thinking budgets per effort word.** None built in (Qwen caps low and medium); an operator can set one per word in the effort table.
 5. **`/props` DSpark fields**, **`count_tokens`**: small, generic, outside this arch.
 

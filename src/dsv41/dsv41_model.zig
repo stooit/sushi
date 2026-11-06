@@ -508,6 +508,34 @@ pub fn stateBytes(st: *const State) u64 {
     return bytes;
 }
 
+/// The continuation and its live restore points have the same owner and lifetime.
+pub const Request = struct {
+    state: ?State = null,
+    epoch: u64 = 0,
+    ahead: ?*engram.Prefetch = null,
+    live: @import("dsv41_prefix.zig").Live = .{},
+
+    pub fn deinit(self: *Request, allocator: std.mem.Allocator) void {
+        if (self.ahead) |pf| pf.finish();
+        if (self.state) |*st| st.deinit();
+        self.live.deinit(allocator);
+        self.* = .{};
+    }
+
+    pub fn bytes(self: *const Request) u64 {
+        return (if (self.state) |*st| stateBytes(st) else @as(u64, 0)) + self.live.bytes();
+    }
+};
+
+/// A different request may reuse the expert scratch only after all deferred state is materialized.
+pub fn settleRequest(m: *Model) !void {
+    try pipeDrain(m);
+    const st = if (m.request().state) |*st| st else return;
+    if (!st.main_lazy) return;
+    try flushMain(st);
+    try mlx.check(mlx.mlx_synchronize(m.s));
+}
+
 // ── the model ────────────────────────────────────────────────────────────
 
 pub const Opts = struct {
@@ -677,9 +705,8 @@ pub const Model = struct {
     /// Bytes this load built in owned regions rather than read from the shards: widened f32 tensors, shared stacks,
     /// the DSpark ragged storage.
     built: struct { widened: u64 = 0, stacks: u64 = 0, ragged: u64 = 0 } = .{},
-    dec_state: ?State = null,
-    /// Counts the states dropped: a record of the live state (`dsv41_prefix.Live`) holds only while it is unchanged.
-    state_epoch: u64 = 0,
+    idle_request: Request = .{},
+    active_request: ?*Request = null,
     /// Tests: named intermediates of a chunk.
     trace: ?*Trace = null,
     /// A calibration capture's view of the linears' inputs.
@@ -706,8 +733,7 @@ pub const Model = struct {
     /// A DSpark round's trunk linears give a row the same bytes at every verify width, a one-row round included, so greedy
     /// text does not depend on the round mix (`SUSHI_DSV41_DSPARK_EXACT=0` takes the faster arms, which sum by width).
     dspark_exact: bool = true,
-    /// The next chunk's Engram rows, read while this one runs; the next pass takes them when its row ids are the same.
-    engram_ahead: ?*engram.Prefetch = null,
+
     engram_ahead_used: u64 = 0,
     /// Prefill chunks that left state only (`extendState`).
     state_only_used: u64 = 0,
@@ -758,8 +784,8 @@ pub const Model = struct {
     pub fn deinit(self: *Model) void {
         pipeDrain(self) catch {};
         if (self.profile) |pf| self.gpa.destroy(pf);
-        if (self.dec_state) |*st| st.deinit();
-        self.dropAhead();
+        std.debug.assert(self.active_request == null);
+        self.idle_request.deinit(self.gpa);
         for (self.engrams) |*e| closeEngram(e);
         self.gpa.free(self.engrams);
         self.gpa.free(self.token_map);
@@ -778,9 +804,17 @@ pub const Model = struct {
         self.gpa.destroy(self);
     }
 
+    pub fn request(self: *Model) *Request {
+        return self.active_request orelse &self.idle_request;
+    }
+
+    pub fn requestConst(self: *const Model) *const Request {
+        return self.active_request orelse &self.idle_request;
+    }
+
     fn dropAhead(self: *Model) void {
-        if (self.engram_ahead) |pf| pf.finish();
-        self.engram_ahead = null;
+        if (self.request().ahead) |pf| pf.finish();
+        self.request().ahead = null;
     }
 
     fn own(self: *Model, x: A) !A {
@@ -2721,17 +2755,17 @@ fn appendVerifyArrays(gpa: std.mem.Allocator, ev: *std.ArrayList(A), st: *const 
 }
 
 pub fn ensureState(m: *Model) !*State {
-    if (m.dec_state == null) m.dec_state = try newState(m);
-    return &m.dec_state.?;
+    if (m.request().state == null) m.request().state = try newState(m);
+    return &m.request().state.?;
 }
 
 pub fn resetState(m: *Model) void {
     // Layers in flight read the state about to be freed.
     pipeDrain(m) catch {};
     m.dropAhead();
-    if (m.dec_state) |*st| st.deinit();
-    m.dec_state = null;
-    m.state_epoch +%= 1;
+    if (m.request().state) |*st| st.deinit();
+    m.request().state = null;
+    m.request().epoch +%= 1;
 }
 
 /// Every decode width a request can take (1..16 rows, after a short prefill so compressed rows exist), with DSpark a
@@ -2938,7 +2972,7 @@ pub fn restoreState(m: *Model, slots: []const Slot, n: usize, ids: []const u32) 
 /// Whether no row buffer of the live state is larger than a `prompt_len`-token request's own would be, with the
 /// quarter its bill adds (`server.prefillNeededAtChunk`): the live buffers are kept whole by `rollbackState`, so only then are they paid for.
 pub fn liveRowsFit(m: *const Model, prompt_len: usize) bool {
-    const st = m.dec_state orelse return false;
+    const st = m.requestConst().state orelse return false;
     for (st.layers, 0..) |*ls, li| for ([_]?Rows{ ls.comp, ls.idx_k }) |rows_| if (rows_) |r| {
         const own = (prompt_len / m.ratio(li) + 1) * 5 / 4;
         if (r.cap > @max(own, 64)) return false;
@@ -2951,7 +2985,7 @@ pub fn liveRowsFit(m: *const Model, prompt_len: usize) bool {
 /// `n / ratio`, because rows are append-only. The arrays are shared, never written. Checked whole before anything
 /// changes; the caller guarantees the first `n` of `ids` are the tokens the state was built from.
 pub fn rollbackState(m: *Model, slots: []const Slot, n: usize, ids: []const u32) !void {
-    const st = &(m.dec_state orelse return error.Dsv41NoLiveState);
+    const st = &(m.request().state orelse return error.Dsv41NoLiveState);
     if (st.verify != null or slots.len != slotCount(m) or ids.len < n or st.n < n) return error.Dsv41CheckpointMismatch;
     if (m.hash != null and st.hist.items.len < n) return error.Dsv41CheckpointMismatch;
     for (st.layers, 0..) |*ls, li| {
@@ -2982,7 +3016,7 @@ pub fn rollbackState(m: *Model, slots: []const Slot, n: usize, ids: []const u32)
 /// has since moved on: the fixed arrays are shared, and the compressed and index rows are views of the live rows' first
 /// `n / ratio`, which are the point's own because rows are append-only. Checked whole before anything is taken.
 pub fn captureLiveShared(m: *Model, fixed: []const Slot, n: usize, out: []Slot) !void {
-    const st = &(m.dec_state orelse return error.Dsv41NoLiveState);
+    const st = &(m.request().state orelse return error.Dsv41NoLiveState);
     if (st.verify != null or fixed.len != slotCount(m) or out.len != slotCount(m) or st.n < n) return error.Dsv41CheckpointMismatch;
     for (st.layers, 0..) |*ls, li| for ([_]?Rows{ ls.comp, ls.idx_k }) |rows_| if (rows_) |rows| if (rows.used < n / m.ratio(li)) return error.Dsv41CheckpointMismatch;
     errdefer for (out) |*sl| freeSlot(sl);
@@ -3680,8 +3714,8 @@ fn reportEngramWait(m: *Model, L: usize) void {
 /// A chunk's Engram rows start reading now, one grid of one span per table, so each table's reads hide behind the
 /// layers before it (a decode token's: layer 0 for layer 1, layers 0-13 for layer 14).
 fn prefetchEngram(m: *Model, p: *Pass) !void {
-    const carried = m.engram_ahead;
-    m.engram_ahead = null;
+    const carried = m.request().ahead;
+    m.request().ahead = null;
     var adopted = false;
     defer if (carried) |pf| if (!adopted) pf.finish();
     const hs = &(m.hash orelse return);
@@ -3718,7 +3752,7 @@ fn aheadEngram(m: *Model, p: *Pass) !void {
     var tables: [cfg_mod.max_engram]*const engram.Table = undefined;
     for (m.engrams, 0..) |*e, i| tables[i] = &e.table;
     m.dropAhead();
-    m.engram_ahead = try engram.Prefetch.start(gpa, tables[0..m.engrams.len], &.{.{ .at = p.st.hist.items.len, .len = comp.len, .ids = rows }}, hs.cols(), comp.len);
+    m.request().ahead = try engram.Prefetch.start(gpa, tables[0..m.engrams.len], &.{.{ .at = p.st.hist.items.len, .len = comp.len, .ids = rows }}, hs.cols(), comp.len);
 }
 
 /// Whether the pass's chunk runs the CED decoder over its last rows only: it does when it is wider than the window and
@@ -5682,21 +5716,21 @@ test "dsv41 Engram: the carried look-ahead is freed by a reset, by a failed pass
     defer testing.allocator.free(ids);
     try testing.expectEqual(@as(usize, 0), imageRows(m, ids));
     _ = mlx.mlx_array_free(try extendAhead(m, ids[0..20], .last, 5, null, ids[20..]));
-    try testing.expect(m.engram_ahead != null);
+    try testing.expect(m.request().ahead != null);
     resetState(m);
-    try testing.expect(m.engram_ahead == null);
+    try testing.expect(m.request().ahead == null);
 
     // The next chunk holds an image span no rows were given for: the pass fails, and the rows read for it go.
     for (ids[22..26]) |*id| id.* = t.image_id;
     _ = mlx.mlx_array_free(try extendAhead(m, ids[0..20], .last, 5, null, ids[20..]));
-    try testing.expect(m.engram_ahead != null);
+    try testing.expect(m.request().ahead != null);
     try testing.expectError(error.Dsv41VisionRowsMissing, extendAhead(m, ids[20..], .last, 5, null, &.{}));
-    try testing.expect(m.engram_ahead == null);
+    try testing.expect(m.request().ahead == null);
 
     // A request that ends here leaves its look-ahead to the unload.
     resetState(m);
     _ = mlx.mlx_array_free(try extendAhead(m, ids[0..20], .last, 5, null, ids[20..]));
-    try testing.expect(m.engram_ahead != null);
+    try testing.expect(m.request().ahead != null);
 }
 
 pub const AttnCase = struct { L: usize, wp: usize, K: usize, nc: usize, holes: bool = true, H: usize = 64, hd: usize = 512, window: usize = 128 };
@@ -6685,4 +6719,21 @@ test "dsv41 pipeline: the ring hands back the oldest layer once more than the de
     try testing.expectEqual(h.at(3 + 2 * pipe_max).ctx, ring.pop().?.ctx);
     try testing.expectEqual(@as(?A, null), ring.pop());
     try testing.expectEqual(@as(usize, 0), ring.n);
+}
+
+test "dsv41 reset releases token history and invalidates live prefix identity" {
+    const a = std.testing.allocator;
+    var m: Model = undefined;
+    m.pipe = .{};
+    m.idle_request = .{};
+    m.active_request = null;
+    m.request().ahead = null;
+    m.request().epoch = 17;
+    m.request().state = .{ .gpa = a, .layers = &.{}, .n = 3 };
+    try m.request().state.?.hist.appendSlice(a, &.{ 7, 11, 13 });
+    resetState(&m);
+    try std.testing.expect(m.request().state == null);
+    try std.testing.expectEqual(@as(u64, 18), m.request().epoch);
+    resetState(&m);
+    try std.testing.expectEqual(@as(u64, 19), m.request().epoch);
 }
